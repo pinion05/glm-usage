@@ -75,7 +75,8 @@ class GlmUsageTests(unittest.TestCase):
         details = GLM.normalize_details(SAMPLE_DETAILS, "2026-07-25~2026-07-31", 7)
 
         self.assertEqual(details["model_calls"], 9745)
-        self.assertEqual(details["total_tokens"], sum(details["models"].values()))
+        self.assertEqual(details["total_tokens"], 1_134_473_530)
+        self.assertEqual(details["period"], "2026-07-25~2026-07-31")
         self.assertEqual(details["models"]["GLM-4.6V"], 19_106)
 
     def test_text_contains_remaining_quota_without_secrets(self) -> None:
@@ -206,6 +207,55 @@ class GlmUsageTests(unittest.TestCase):
         message = str(caught.exception)
         self.assertNotIn("sensitive-token", message)
         self.assertNotIn("Bearer", message)
+
+    def test_subprocess_os_error_is_wrapped_without_details(self) -> None:
+        with (
+            mock.patch.object(GLM.shutil, "which", return_value="agent-browser"),
+            mock.patch.object(GLM.subprocess, "run", side_effect=OSError("sensitive-path")),
+        ):
+            with self.assertRaises(GLM.UsageError) as caught:
+                GLM._agent_browser(9222, "tab", "list")
+
+        self.assertNotIn("sensitive-path", str(caught.exception))
+
+    def test_percentage_parser_and_number_formatting(self) -> None:
+        self.assertEqual(GLM.clamp_percent(0, "test"), 0)
+        self.assertEqual(GLM.clamp_percent(100, "test"), 100)
+        with self.assertRaises(GLM.UsageError):
+            GLM.clamp_percent(-1, "test")
+        with self.assertRaises(GLM.UsageError):
+            GLM.clamp_percent(101, "test")
+        self.assertEqual(GLM.human_number(1_500_000), "1.5M")
+        self.assertEqual(GLM.human_number(None), "-")
+
+    def test_model_usage_period_boundaries(self) -> None:
+        now = datetime(2026, 7, 31, 13, 40, tzinfo=GLM.KST)
+
+        one_day, one_period = GLM.model_usage_params(1, now)
+        self.assertEqual(one_day["startTime"], "2026-07-31 00:00:00")
+        self.assertEqual(one_day["endTime"], "2026-07-31 23:59:59")
+        self.assertEqual(one_period, "2026-07-31~2026-07-31")
+
+        year, year_period = GLM.model_usage_params(366, now)
+        self.assertEqual(year["startTime"], "2025-07-31 00:00:00")
+        self.assertEqual(year_period, "2025-07-31~2026-07-31")
+
+    def test_body_auth_code_raises_auth_expired(self) -> None:
+        class Response:
+            headers: dict[str, str] = {}
+
+            def __enter__(self) -> "Response":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b'{"code":401,"success":false}'
+
+        with mock.patch.object(GLM.urllib.request, "urlopen", return_value=Response()):
+            with self.assertRaises(GLM.AuthExpired):
+                GLM.api_get("quota/limit", "test-token")
 
 
 if __name__ == "__main__":

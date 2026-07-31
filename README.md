@@ -1,6 +1,6 @@
-<div align="center">
-
 # 📊 GLM Usage
+
+<div align="center">
 
 **Z.ai GLM Coding Plan 잔여량을 한 명령으로 확인하세요.**
 

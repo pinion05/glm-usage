@@ -31,6 +31,10 @@ class UsageError(RuntimeError):
     pass
 
 
+class AuthExpired(UsageError):
+    pass
+
+
 def _secure_config_dir() -> None:
     try:
         CONFIG_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -132,6 +136,8 @@ def _agent_browser(port: int, *args: str) -> dict:
         )
     except subprocess.TimeoutExpired as exc:
         raise UsageError("브라우저 작업 시간 초과") from exc
+    except OSError as exc:
+        raise UsageError("agent-browser 실행 실패") from exc
     if proc.returncode != 0:
         raise UsageError(f"브라우저 작업 실패(exit {proc.returncode})")
     try:
@@ -224,7 +230,7 @@ def api_get(path: str, token: str, params: dict[str, str] | None = None) -> tupl
             response_headers = dict(response.headers.items())
     except urllib.error.HTTPError as exc:
         if exc.code in (401, 403):
-            raise UsageError("AUTH_EXPIRED") from exc
+            raise AuthExpired("Z.ai 인증이 만료됨") from exc
         raise UsageError(f"Z.ai API HTTP {exc.code}") from exc
     except urllib.error.URLError as exc:
         raise UsageError("Z.ai API 연결 실패") from exc
@@ -233,6 +239,8 @@ def api_get(path: str, token: str, params: dict[str, str] | None = None) -> tupl
         payload = json.loads(body)
     except json.JSONDecodeError as exc:
         raise UsageError("Z.ai API가 JSON이 아닌 응답을 반환함") from exc
+    if payload.get("code") in (401, 403, "401", "403"):
+        raise AuthExpired("Z.ai 인증이 만료됨")
     if payload.get("code") != 200 or not payload.get("success", True):
         raise UsageError(f"Z.ai API 오류(code={payload.get('code')})")
     return payload, response_headers
@@ -247,9 +255,8 @@ def request_with_auth_retry(
     try:
         payload, headers = api_get(path, token, params)
         return payload, headers, token
-    except UsageError as exc:
-        if str(exc) != "AUTH_EXPIRED":
-            raise
+    except AuthExpired:
+        pass
     refreshed = refresh_token_from_browser(port)
     payload, headers = api_get(path, refreshed, params)
     return payload, headers, refreshed
@@ -486,10 +493,7 @@ def main() -> int:
             print(format_text(result))
         return 0
     except UsageError as exc:
-        message = str(exc)
-        if message == "AUTH_EXPIRED":
-            message = "Z.ai 인증이 만료됐고 브라우저에서 갱신하지 못함"
-        print(f"오류: {message}", file=sys.stderr)
+        print(f"오류: {exc}", file=sys.stderr)
         print(
             "해결: Z.ai 대시보드에 로그인한 Chrome(CDP 9222)을 켠 뒤 "
             "`glm-usage --refresh-auth` 실행",
