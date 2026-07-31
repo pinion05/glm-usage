@@ -32,10 +32,10 @@ cp SKILL.md ~/.hermes/skills/devops/glm-usage/
 cp -r scripts ~/.hermes/skills/devops/glm-usage/
 ```
 
-Hermes에서는 다음 세션부터 `glm-usage` 스킬을 자동으로 인식합니다. 즉시 불러오려면:
+Hermes에서는 다음 세션부터 `glm-usage` 스킬을 자동으로 인식합니다. CLI에서 즉시 불러오려면:
 
-```text
-/skill glm-usage
+```bash
+hermes chat --skills glm-usage
 ```
 
 ## 💡 사용법
