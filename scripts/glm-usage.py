@@ -5,11 +5,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shutil
 import stat
 import subprocess
 import sys
+import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -28,16 +31,50 @@ class UsageError(RuntimeError):
     pass
 
 
+def _secure_config_dir() -> None:
+    try:
+        CONFIG_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(CONFIG_DIR, flags)
+        try:
+            if not stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise UsageError("인증 설정 경로가 디렉터리가 아님")
+            os.fchmod(fd, 0o700)
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        raise UsageError("인증 설정 디렉터리를 안전하게 열 수 없음") from exc
+
+
 def read_token() -> str | None:
     env_token = os.environ.get("ZAI_DASHBOARD_TOKEN", "").strip()
     if env_token:
         return env_token.removeprefix("Bearer ").strip()
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
-        token = TOKEN_FILE.read_text(encoding="utf-8").strip()
+        fd = os.open(TOKEN_FILE, flags)
     except FileNotFoundError:
         return None
+    except OSError as exc:
+        raise UsageError("토큰 파일을 안전하게 열 수 없음") from exc
+
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise UsageError("토큰 경로가 일반 파일이 아님")
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            fd = -1
+            token = handle.read(65_537).strip()
+    except OSError as exc:
+        raise UsageError("토큰 파일을 안전하게 읽을 수 없음") from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+    if len(token) > 65_536:
+        raise UsageError("토큰 파일이 비정상적으로 큼")
     if token:
-        os.chmod(TOKEN_FILE, stat.S_IRUSR | stat.S_IWUSR)
         return token.removeprefix("Bearer ").strip()
     return None
 
@@ -46,44 +83,63 @@ def save_token(token: str) -> None:
     token = token.removeprefix("Bearer ").strip()
     if not token:
         raise UsageError("빈 인증 토큰은 저장할 수 없음")
-    CONFIG_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(CONFIG_DIR, 0o700)
-    tmp = TOKEN_FILE.with_suffix(".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    _secure_config_dir()
+
+    fd = -1
+    verify_fd = -1
+    tmp: Path | None = None
     try:
+        fd, tmp_name = tempfile.mkstemp(prefix=".token-", dir=CONFIG_DIR)
+        tmp = Path(tmp_name)
+        os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
             handle.write(token)
             handle.write("\n")
         os.replace(tmp, TOKEN_FILE)
-        os.chmod(TOKEN_FILE, 0o600)
+        tmp = None
+
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        verify_fd = os.open(TOKEN_FILE, flags)
+        if not stat.S_ISREG(os.fstat(verify_fd).st_mode):
+            raise UsageError("저장된 토큰 경로가 일반 파일이 아님")
+        os.fchmod(verify_fd, 0o600)
+    except OSError as exc:
+        raise UsageError("토큰을 안전하게 저장할 수 없음") from exc
     finally:
-        try:
-            tmp.unlink()
-        except FileNotFoundError:
-            pass
+        if fd >= 0:
+            os.close(fd)
+        if verify_fd >= 0:
+            os.close(verify_fd)
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def _agent_browser(port: int, *args: str) -> dict:
     binary = shutil.which("agent-browser")
     if not binary:
         raise UsageError("agent-browser가 없어 브라우저 인증을 갱신할 수 없음")
-    proc = subprocess.run(
-        [binary, "--cdp", str(port), *args, "--json"],
-        text=True,
-        capture_output=True,
-        timeout=30,
-        check=False,
-    )
+    try:
+        proc = subprocess.run(
+            [binary, "--cdp", str(port), *args, "--json"],
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise UsageError("브라우저 작업 시간 초과") from exc
     if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout).strip().splitlines()
-        message = detail[-1] if detail else f"exit {proc.returncode}"
-        raise UsageError(f"브라우저 연결 실패: {message}")
+        raise UsageError(f"브라우저 작업 실패(exit {proc.returncode})")
     try:
         payload = json.loads(proc.stdout)
     except json.JSONDecodeError as exc:
         raise UsageError("agent-browser 응답을 해석하지 못함") from exc
     if not payload.get("success"):
-        raise UsageError(f"브라우저 작업 실패: {payload.get('error') or 'unknown error'}")
+        raise UsageError("브라우저 작업 실패")
     return payload.get("data") or {}
 
 
@@ -95,7 +151,7 @@ def refresh_token_from_browser(port: int) -> str:
         (
             tab.get("tabId")
             for tab in tabs
-            if str(tab.get("url", "")).startswith(("https://z.ai/", "https://api.z.ai/"))
+            if str(tab.get("url", "")).startswith("https://z.ai/")
         ),
         None,
     )
@@ -109,7 +165,9 @@ def refresh_token_from_browser(port: int) -> str:
         )
         zai_tab = created.get("tabId") or created.get("id")
         created_tab = True
-        if not zai_tab:
+        for _ in range(10):
+            if zai_tab:
+                break
             tabs = (_agent_browser(port, "tab", "list").get("tabs") or [])
             zai_tab = next(
                 (
@@ -119,19 +177,27 @@ def refresh_token_from_browser(port: int) -> str:
                 ),
                 None,
             )
+            if not zai_tab:
+                time.sleep(0.5)
     if not zai_tab:
         raise UsageError("Z.ai 브라우저 탭을 만들지 못함")
 
     try:
         _agent_browser(port, "tab", str(zai_tab))
-        if created_tab:
-            _agent_browser(port, "wait", "2500")
-        result = _agent_browser(port, "eval", f'localStorage.getItem("{TOKEN_KEY}")')
-        token = result.get("result")
+        token = None
+        attempts = 40 if created_tab else 1
+        for attempt in range(attempts):
+            result = _agent_browser(port, "eval", f'localStorage.getItem("{TOKEN_KEY}")')
+            candidate = result.get("result")
+            if isinstance(candidate, str) and candidate.strip():
+                token = candidate.strip()
+                break
+            if attempt + 1 < attempts:
+                time.sleep(0.5)
         if not isinstance(token, str) or not token.strip():
-            raise UsageError("Z.ai 로그인 토큰이 없음. 대시보드에서 먼저 로그인해야 함")
+            raise UsageError("Z.ai 페이지 로딩이 끝나지 않았거나 로그인이 필요함")
         save_token(token)
-        return token.strip()
+        return token
     finally:
         if previous and previous != zai_tab:
             try:
@@ -159,17 +225,16 @@ def api_get(path: str, token: str, params: dict[str, str] | None = None) -> tupl
     except urllib.error.HTTPError as exc:
         if exc.code in (401, 403):
             raise UsageError("AUTH_EXPIRED") from exc
-        detail = exc.read(500).decode("utf-8", errors="replace")
-        raise UsageError(f"Z.ai API HTTP {exc.code}: {detail}") from exc
+        raise UsageError(f"Z.ai API HTTP {exc.code}") from exc
     except urllib.error.URLError as exc:
-        raise UsageError(f"Z.ai API 연결 실패: {exc.reason}") from exc
+        raise UsageError("Z.ai API 연결 실패") from exc
 
     try:
         payload = json.loads(body)
     except json.JSONDecodeError as exc:
         raise UsageError("Z.ai API가 JSON이 아닌 응답을 반환함") from exc
     if payload.get("code") != 200 or not payload.get("success", True):
-        raise UsageError(f"Z.ai API 오류: {payload.get('msg') or payload.get('code')}")
+        raise UsageError(f"Z.ai API 오류(code={payload.get('code')})")
     return payload, response_headers
 
 
@@ -191,36 +256,83 @@ def request_with_auth_retry(
 
 
 def find_limit(limits: list[dict], limit_type: str) -> dict:
-    return next((item for item in limits if item.get("type") == limit_type), {})
+    limit = next(
+        (item for item in limits if isinstance(item, dict) and item.get("type") == limit_type),
+        None,
+    )
+    if limit is None:
+        raise UsageError(f"Z.ai API 응답 스키마 변경: {limit_type} 누락")
+    return limit
 
 
-def clamp_percent(value: object) -> int:
+def required_number(value: object, label: str) -> float:
+    if isinstance(value, bool):
+        raise UsageError(f"Z.ai API 응답 스키마 변경: {label}이 숫자가 아님")
+    if not isinstance(value, (int, float, str)):
+        raise UsageError(f"Z.ai API 응답 스키마 변경: {label}이 숫자가 아님")
     try:
-        number = round(float(value))
-    except (TypeError, ValueError):
-        number = 0
-    return max(0, min(100, number))
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise UsageError(f"Z.ai API 응답 스키마 변경: {label}이 숫자가 아님") from exc
+    if not math.isfinite(number):
+        raise UsageError(f"Z.ai API 응답 스키마 변경: {label}이 유한수가 아님")
+    return number
 
 
-def reset_time_kst(milliseconds: object) -> str | None:
-    try:
-        value = float(milliseconds)
-    except (TypeError, ValueError):
-        return None
+def required_int(mapping: dict, key: str, context: str) -> int:
+    if key not in mapping:
+        raise UsageError(f"Z.ai API 응답 스키마 변경: {context}.{key} 누락")
+    number = required_number(mapping[key], f"{context}.{key}")
+    if not number.is_integer():
+        raise UsageError(f"Z.ai API 응답 스키마 변경: {context}.{key}이 정수가 아님")
+    return int(number)
+
+
+def clamp_percent(value: object, label: str) -> int:
+    number = required_number(value, label)
+    if number < 0 or number > 100:
+        raise UsageError(f"Z.ai API 응답 스키마 변경: {label} 범위 오류")
+    return round(number)
+
+
+def reset_time_kst(milliseconds: object) -> str:
+    value = required_number(milliseconds, "TIME_LIMIT.nextResetTime")
     return datetime.fromtimestamp(value / 1000, tz=KST).strftime("%Y-%m-%d %H:%M KST")
 
 
 def normalize_quota(payload: dict, fetched_at: datetime) -> dict:
-    data = payload.get("data") or {}
-    limits = data.get("limits") or []
+    data = payload.get("data")
+    if not isinstance(data, dict) or not isinstance(data.get("limits"), list):
+        raise UsageError("Z.ai API 응답 스키마 변경: data.limits 누락")
+    limits = data["limits"]
     five_hours = find_limit(limits, "TOKENS_LIMIT")
     mcp = find_limit(limits, "TIME_LIMIT")
 
-    five_used = clamp_percent(five_hours.get("percentage"))
-    mcp_used = clamp_percent(mcp.get("percentage"))
-    mcp_total = mcp.get("usage")
-    mcp_current = mcp.get("currentValue")
-    mcp_remaining_value = mcp.get("remaining")
+    if "percentage" not in five_hours or "percentage" not in mcp:
+        raise UsageError("Z.ai API 응답 스키마 변경: quota percentage 누락")
+    five_used = clamp_percent(five_hours["percentage"], "TOKENS_LIMIT.percentage")
+    mcp_used = clamp_percent(mcp["percentage"], "TIME_LIMIT.percentage")
+    mcp_total = required_int(mcp, "usage", "TIME_LIMIT")
+    mcp_current = required_int(mcp, "currentValue", "TIME_LIMIT")
+    mcp_remaining_value = required_int(mcp, "remaining", "TIME_LIMIT")
+    if mcp_total < 0 or mcp_current < 0 or mcp_remaining_value < 0:
+        raise UsageError("Z.ai API 응답 스키마 변경: MCP 사용량이 음수임")
+    if mcp_current + mcp_remaining_value != mcp_total:
+        raise UsageError("Z.ai API 응답 스키마 변경: MCP 합계가 일치하지 않음")
+
+    usage_details = mcp.get("usageDetails", [])
+    if not isinstance(usage_details, list):
+        raise UsageError("Z.ai API 응답 스키마 변경: TIME_LIMIT.usageDetails 형식 오류")
+    tools: dict[str, int] = {}
+    for index, item in enumerate(usage_details):
+        if not isinstance(item, dict) or not item.get("modelCode"):
+            raise UsageError(f"Z.ai API 응답 스키마 변경: usageDetails[{index}] 형식 오류")
+        tools[str(item["modelCode"])] = required_int(
+            item, "usage", f"TIME_LIMIT.usageDetails[{index}]"
+        )
+
+    if "nextResetTime" not in mcp:
+        raise UsageError("Z.ai API 응답 스키마 변경: TIME_LIMIT.nextResetTime 누락")
 
     return {
         "plan_level": data.get("level"),
@@ -234,12 +346,8 @@ def normalize_quota(payload: dict, fetched_at: datetime) -> dict:
             "used": mcp_current,
             "limit": mcp_total,
             "remaining": mcp_remaining_value,
-            "next_reset": reset_time_kst(mcp.get("nextResetTime")),
-            "tools": {
-                str(item.get("modelCode")): item.get("usage")
-                for item in (mcp.get("usageDetails") or [])
-                if item.get("modelCode")
-            },
+            "next_reset": reset_time_kst(mcp["nextResetTime"]),
+            "tools": tools,
         },
         "fetched_at": fetched_at.astimezone(KST).strftime("%Y-%m-%d %H:%M:%S KST"),
         "delay_notice": "대시보드 안내 기준 약 10분 지연 가능",
@@ -257,17 +365,28 @@ def model_usage_params(days: int, now: datetime) -> tuple[dict[str, str], str]:
 
 
 def normalize_details(payload: dict, period: str, days: int) -> dict:
-    total = ((payload.get("data") or {}).get("totalUsage") or {})
+    data = payload.get("data")
+    if not isinstance(data, dict) or not isinstance(data.get("totalUsage"), dict):
+        raise UsageError("Z.ai API 응답 스키마 변경: data.totalUsage 누락")
+    total = data["totalUsage"]
+    model_calls = required_int(total, "totalModelCallCount", "totalUsage")
+    total_tokens = required_int(total, "totalTokensUsage", "totalUsage")
+    summaries = total.get("modelSummaryList", [])
+    if not isinstance(summaries, list):
+        raise UsageError("Z.ai API 응답 스키마 변경: modelSummaryList 형식 오류")
+    models: dict[str, int] = {}
+    for index, item in enumerate(summaries):
+        if not isinstance(item, dict) or not item.get("modelName"):
+            raise UsageError(f"Z.ai API 응답 스키마 변경: modelSummaryList[{index}] 형식 오류")
+        models[str(item["modelName"])] = required_int(
+            item, "totalTokens", f"modelSummaryList[{index}]"
+        )
     return {
         "days": days,
         "period": period,
-        "model_calls": total.get("totalModelCallCount", 0),
-        "total_tokens": total.get("totalTokensUsage", 0),
-        "models": {
-            str(item.get("modelName")): item.get("totalTokens", 0)
-            for item in (total.get("modelSummaryList") or [])
-            if item.get("modelName")
-        },
+        "model_calls": model_calls,
+        "total_tokens": total_tokens,
+        "models": models,
     }
 
 
